@@ -317,17 +317,263 @@ The model outperforms the baseline by approximately 4.3 percentage points in mea
 
 ### 5.1 Logical Leaps and Missing Steps in the Data Pipeline
 
-**Missing coreference resolution step:** The NeuralCoref coreference resolution step (described in the README as applied before OpenIE) is not implemented in any notebook. The `new_sample_solved.csv` file name implies the texts are "solved" (i.e., coreference-resolved), but the resolution process itself is not reproducible from the provided code. Users cannot recreate the `eval_extract.pickle` starting from raw text.
+The following six issues are documented with exact code references, worked examples, assessed impact, and suggested remediation.
 
-**Missing OpenIE invocation:** The Stanford OpenIE server call that produces `eval_extract.pickle` is not present in any notebook. There is no code cell that calls the OpenIE REST API or command-line tool. The pipeline is therefore only reproducible from `eval_extract.pickle` onward, not from raw text.
+---
 
-**Vectorizer state leak in `merge_concepts` and `remove_similar_phrases`:** Both functions call `vectorizer.fit_transform(...)` where `vectorizer` is a module-level `TfidfVectorizer` instance defined in **Cell 3**. When `cmap_pipeline` is called in a loop over 19 titles (in **Cell 22**), the vectorizer is re-fit from scratch on each call's internal data, but the module-level state is shared across calls. This is not technically a data-leakage problem in this context (because the vectorizer is re-fit each time), but it makes the code non-thread-safe and produces side effects: the vocabulary fit during `merge_concepts` is immediately overwritten by the fit during `remove_similar_phrases`, meaning `merge_concepts` and `remove_similar_phrases` each use a freshly fit vocabulary on their respective inputs, which is the correct behaviour, but the module-level vectorizer object is mutated as a side effect.
+#### Critique 1 — Missing Coreference Resolution Step
 
-**Single-pass cluster merging in `merge_concepts`:** The cluster merging loop in `merge_concepts` (**Cell 3**, lines 86–91) is a single forward pass over the list. If clusters A and B overlap, and B and C overlap (but A and C do not directly), then A ∪ B is formed in the first pass, but B ∪ C is computed relative to the original B. The merged cluster A ∪ B is not propagated back to check transitivity with C. This can result in two separate clusters that should logically be one.
+**What the code says:** `data/new_sample_solved.csv` is loaded in **main_notebook Cell 16** via:
+```python
+eval_sample = pd.read_csv('../data/new_sample_solved.csv')
+```
+The README states: *"Before applying OpenIE, the text undergoes coreference resolution using NeuralCoref to handle pronouns and link them to their respective entities."* The filename `new_sample_solved.csv` (emphasis on "solved") and the README description together imply that a coreference resolution step was applied to the raw Wikipedia paragraphs before they were stored in this file. However, **no notebook or script in the repository performs this step**. There is no `import neuralcoref`, no `nlp.add_pipe('neuralcoref')` call, and no pipeline cell that takes raw text and outputs coreference-resolved text.
 
-**Confidence threshold is computed on the post-filtering DataFrame:** In **Cell 15**, `df['confidence'].quantile(min_conf_level)` is computed after `remove_similar_phrases` has already modified `df`. The median confidence is therefore computed on a subset of the original relations rather than on the full raw extraction output. This means the effective confidence cutoff is different from what would be obtained if filtering were applied to the raw OpenIE output — a subtle but reproducibility-relevant design choice that is not documented.
+**Why this matters in practice:** Coreference resolution is the process of replacing pronouns and abbreviated references with the full noun phrase they refer to. For example, consider the sentence *"Napoleon was exiled to Elba. He returned in 1815."* Without resolution, OpenIE would extract the triple `(He, returned, in 1815)`, which produces the meaningless map node "he". With NeuralCoref, "He" is resolved to "Napoleon" before extraction, yielding the correct triple `(Napoleon, returned, in 1815)`. In the 19-paragraph evaluation set, topics include historical figures (Brenton Tarrant, Pugachev's Rebellion) and political entities — both domains with dense pronoun use. A pronoun-filled `arg1` would (a) create anonymous, uninformative nodes in the graph, and (b) be correctly flagged as invalid by the `contains_noun` filter or the `arg1` classifier, meaning such triples would be silently dropped rather than correctly attributed. The net effect is that the pipeline generates fewer concept map nodes than it would from the resolved text, reducing recall without the user being aware why.
 
-**`for_class` in main_notebook uses only `arg1` features but does not include `confidence`:** The inference version of `for_class` (**main_notebook Cell 1**) assembles a feature matrix of shape `(n, 396)` from embedding + POS features. However, the training version in **classifier Cell 37** also does not include `confidence` as a feature. The first-attempt training in **classifier Cell 18–19** did include `confidence`, but the second-attempt `for_class` does not. This is consistent between training and inference, but the exclusion of a potentially informative feature (OpenIE's self-assessed confidence) is not explicitly justified.
+**What cannot be reproduced:** The raw Wikipedia paragraphs → coreference-resolved paragraphs transformation cannot be repeated from the available code. This means it is impossible to rerun the full end-to-end pipeline on new paragraphs without (a) installing the specific version of NeuralCoref compatible with the spaCy version used (NeuralCoref is only compatible with spaCy v2, which is end-of-life), and (b) writing the resolution script from scratch.
+
+**Suggested fix:** Add a `resolve_coreferences.py` script or a notebook cell with the following structure:
+```python
+import spacy
+import neuralcoref
+
+nlp = spacy.load('en_core_web_sm')
+neuralcoref.add_to_pipe(nlp)
+
+def resolve_coreferences(text):
+    doc = nlp(text)
+    return doc._.coref_resolved  # NeuralCoref attribute
+
+eval_sample['text_resolved'] = eval_sample['text'].apply(resolve_coreferences)
+```
+
+---
+
+#### Critique 2 — Missing OpenIE Invocation
+
+**What the code says:** `data/eval_extract.pickle` is loaded in **main_notebook Cell 17** via:
+```python
+with open('eval_extract.pickle', 'rb') as f:
+    eval_sample_extractions = pickle.load(f)
+```
+This file is a pre-computed Python dictionary where each key is a paragraph title and each value is a DataFrame with columns `['sentence', 'arg1', 'rel', 'arg2', 'confidence']`. **No code in any notebook calls the Stanford OpenIE server** to generate these DataFrames. The README describes the use of *"Open Information Extraction (OpenIE)"* and references the external repository `dair-iitd/OpenIE-standalone`, but there is no HTTP request, no subprocess call, and no Java invocation in any code cell.
+
+**Why this matters in practice:** The Stanford OpenIE standalone server is a Java application. Calling it from Python requires either: (a) starting the server on a given port and sending HTTP POST requests with the text, or (b) invoking it via a command-line wrapper library such as `openie` (PyPI). To reproduce `eval_extract.pickle` from scratch, a user would need to:
+1. Download and start the OpenIE standalone JAR file.
+2. Send each coreference-resolved paragraph to the server sentence by sentence.
+3. Parse the JSON response to extract `arg1`, `rel`, `arg2`, and `confidence` fields.
+4. Assemble the results into DataFrames and pickle them.
+
+None of these steps exist in the repository. The missing code gap is therefore **two layers deep**: first coreference resolution (Critique 1), then OpenIE extraction (this critique). The first cell that actually executes code (`relation_preselection`) already assumes all extraction is done.
+
+**Concrete reproducibility failure:** If a researcher wants to apply this pipeline to a new Wikipedia article — say, "The Battle of Stalingrad" — they cannot do so with the provided code alone. They would need to: (a) write and run the coreference resolution step, (b) write and run the OpenIE extraction step, (c) save the result to a format compatible with `eval_extract.pickle`, and only then (d) call `cmap_pipeline`. In contrast, the README implies this is a complete, runnable pipeline.
+
+**Suggested fix:** A `extract_relations.py` script should be added with:
+```python
+import requests, json, pickle, pandas as pd
+
+# Endpoint for the Stanford OpenIE standalone server (v5.x).
+# The server must be started separately:
+#   java -mx8g -cp "*" edu.stanford.nlp.naturalli.OpenIE --port 8080
+# Adjust the port and endpoint path to match your server configuration.
+OPENIE_URL = "http://localhost:8080/getKBP"
+
+def extract_relations(title, text):
+    rows = []
+    for sentence in text.split('.'):
+        if not sentence.strip():
+            continue
+        response = requests.post(OPENIE_URL, data={'text': sentence})
+        for triple in response.json():
+            rows.append({
+                'sentence': sentence.strip(),
+                'arg1': triple['subject'],
+                'rel': triple['relation'],
+                'arg2': triple['object'],
+                'confidence': triple['confidence']
+            })
+    return pd.DataFrame(rows)
+```
+
+---
+
+#### Critique 3 — Vectorizer State Leak in `merge_concepts` and `remove_similar_phrases`
+
+**What the code says:** In **main_notebook Cell 3**, a single module-level `TfidfVectorizer` instance is created:
+```python
+vectorizer = TfidfVectorizer(ngram_range=(1,2))
+```
+This same `vectorizer` object is subsequently used in two separate functions:
+
+In `merge_concepts` (**Cell 3**):
+```python
+similarity_matrix = cosine_similarity(vectorizer.fit_transform(nodes))
+```
+
+In `remove_similar_phrases` (**Cell 7**):
+```python
+sim = cosine_similarity(vectorizer.fit_transform(df['phrase']))
+```
+
+Both calls use `fit_transform`, which (1) discards any previously learned vocabulary, (2) learns a new vocabulary from the input data, and (3) transforms the input. Because `merge_concepts` is called *before* `remove_similar_phrases` inside `cmap_pipeline` (**Cell 15**), each call to `cmap_pipeline` results in the following sequence:
+- `vectorizer.fit_transform(nodes)` — vectorizer is trained on `arg1` subjects
+- `vectorizer.fit_transform(df['phrase'])` — vectorizer vocabulary is overwritten with phrases
+
+**Why this matters:** Consider what happens when `cmap_pipeline` is called in a loop for 19 titles (**Cell 22**):
+```python
+for i, key in enumerate(eval_sample_extractions.keys()):
+    cmap_pipeline(eval_sample_extractions[key], eval_sample, key, 0.5, i)
+```
+After the first title is processed, `vectorizer.vocabulary_` contains the IDF weights from that title's `df['phrase']`. When the second title's `merge_concepts` is called, `vectorizer.fit_transform` correctly re-fits on the second title's `nodes` — so the output is correct. However, the vocabulary state after the loop finishes reflects the phrases of the last processed title. Any code that runs after the loop and uses `vectorizer.transform(...)` (without re-fitting) would use the wrong vocabulary.
+
+More critically, the shared mutable state means that if this code were ever called from multiple threads (e.g., via `concurrent.futures` to process titles in parallel), the `fit_transform` calls would race: thread A fitting on title 1's nodes while thread B simultaneously uses the partially fitted vocabulary for title 2's phrases. This would produce silently incorrect similarity matrices with no error raised.
+
+**Suggested fix:** Instantiate a fresh `TfidfVectorizer` inside each function call, eliminating the shared state:
+```python
+def merge_concepts(df, title):
+    local_vectorizer = TfidfVectorizer(ngram_range=(1,2))
+    nodes = list(df['arg1'].unique()) + [title]
+    similarity_matrix = cosine_similarity(local_vectorizer.fit_transform(nodes))
+    ...
+
+def remove_similar_phrases(df):
+    local_vectorizer = TfidfVectorizer(ngram_range=(1,2))
+    df['phrase'] = df['arg1'] + ' ' + df['rel'] + ' ' + df['arg2']
+    sim = cosine_similarity(local_vectorizer.fit_transform(df['phrase']))
+    ...
+```
+
+---
+
+#### Critique 4 — Single-Pass Non-Transitive Cluster Merging in `merge_concepts`
+
+**What the code says:** The cluster merging loop in **main_notebook Cell 3** is:
+```python
+for i in range(len(set_list)):
+    for j in range(i+1, len(set_list)):
+        if set_list[i] & set_list[j]:
+            set_list[i] = set_list[i] | set_list[j]
+            set_list[j] = set()
+set_list = [s for s in set_list if s]
+```
+This is a single-pass forward scan: for each cluster `i`, it checks all clusters `j > i` and merges any overlapping clusters into `i`, setting `j` to empty.
+
+**Why this fails — a concrete worked example:**
+
+Suppose a paragraph has four subject phrases:
+- Concept A: `"the United States"`
+- Concept B: `"United States of America"`
+- Concept C: `"America"`
+- Concept D: `"American government"`
+
+The TF-IDF cosine similarity matrix (hypothetical values) might produce:
+- `sim(A, B) = 0.85` → above the 0.4 threshold
+- `sim(B, C) = 0.50` → above the 0.4 threshold
+- `sim(A, C) = 0.12` → **below** the threshold (no shared unigrams other than "America")
+- `sim(C, D) = 0.60` → above the threshold
+- `sim(A, D) = 0.08` → below threshold
+
+After the initial per-node cluster construction (where `set_list[i]` = `{i} ∪ {j | sim(i,j) > 0.4}` for all `i`):
+```
+set_list = [{A, B}, {A, B, C}, {B, C}, {C, D}]
+```
+
+The merge loop runs as follows:
+1. `i=0 ({A,B})`, `j=1 ({A,B,C})`: intersection `{A,B}` is non-empty → merge: `set_list[0] = {A,B,C}`, `set_list[1] = {}`
+2. `i=0 ({A,B,C})`, `j=2 ({B,C})`: intersection `{B,C}` is non-empty → merge: `set_list[0] = {A,B,C}`, `set_list[2] = {}`
+3. `i=0 ({A,B,C})`, `j=3 ({C,D})`: intersection `{C}` is non-empty → merge: `set_list[0] = {A,B,C,D}`, `set_list[3] = {}`
+
+In this example the single pass works correctly because set `0` accumulates everything. However, consider a different ordering where the initial clusters are:
+```
+set_list = [{A, B}, {C, D}, {B, C}]  # ordered so the A-B and C-D clusters appear before the bridging B-C cluster
+```
+1. `i=0 ({A,B})`, `j=1 ({C,D})`: no intersection (A,B do not share with C,D directly) → no merge
+2. `i=0 ({A,B})`, `j=2 ({B,C})`: intersection `{B}` → merge: `set_list[0] = {A,B,C}`, `set_list[2] = {}`
+3. `i=1 ({C,D})`, `j=2 ({})`: empty set, skipped
+
+**Result:** `set_list = [{A,B,C}, {C,D}]` — concept C appears in **two separate clusters**. When the dictionary `d` is built, `C` would be mapped to the representative of the first cluster encountered, and `D` would be mapped to the representative of the second cluster. The intended merge of all four concepts into one cluster **fails silently**.
+
+The correct algorithm is to compute the **transitive closure** of the overlap relation, which requires iterating until no further merges occur:
+```python
+changed = True
+while changed:
+    changed = False
+    for i in range(len(set_list)):
+        for j in range(i+1, len(set_list)):
+            if set_list[i] and set_list[j] and set_list[i] & set_list[j]:
+                set_list[i] = set_list[i] | set_list[j]
+                set_list[j] = set()
+                changed = True
+```
+
+---
+
+#### Critique 5 — Confidence Threshold Computed on the Post-Filtering DataFrame
+
+**What the code says:** Inside `cmap_pipeline` in **main_notebook Cell 15**, the confidence filter is applied **after** five preprocessing steps have already reduced the DataFrame:
+```python
+def cmap_pipeline(df, df_text, title, min_conf_level, index, save_map=True):
+    df = relation_preselection(df)   # step 1 — removes rows by POS tag rules
+    df = filter_rows(df)             # step 2 — removes duplicates and substrings
+    df = merge_concepts(df, title)   # step 3 — collapses similar arg1 nodes
+    df = concat_concepts(df)         # step 4 — merges conjunctions
+    df = remove_similar_phrases(df)  # step 5 — removes semantically similar rows
+    # ↓ threshold is computed here, on the already-reduced df
+    df = df[df['confidence'] >= df["confidence"].quantile(min_conf_level)].reset_index(drop=True)
+```
+
+The parameter `min_conf_level=0.5` selects the 50th percentile (median) of the **current** confidence distribution — i.e., the distribution of confidence scores among the triples that survived the first five filtering steps.
+
+**Why this changes the effective cutoff — a numerical example:**
+
+Suppose the original OpenIE extraction for a title produces 100 triples with confidence scores uniformly distributed between 0.3 and 1.0. The true median of the raw distribution is approximately 0.65.
+
+After `relation_preselection`, suppose 30 low-confidence triples (many of which have pronouns in `arg1`, which OpenIE tends to extract with lower confidence) are removed. The remaining 70 triples have a skewed-right confidence distribution with a new median of approximately 0.72.
+
+After `remove_similar_phrases`, suppose another 15 medium-confidence triples are removed (similarity-based removal does not preferentially target any confidence level). The remaining 55 triples have a median of approximately 0.74.
+
+The confidence filter at `min_conf_level=0.5` now retains the top 50% of these 55 triples — those above 0.74 — yielding approximately 27 triples. If the same filter had been applied to the raw 100 triples first, it would have retained those above 0.65, yielding 50 triples, and subsequent filtering would have operated on a larger (and potentially higher-recall) input set.
+
+**Impact:** The effective confidence threshold is higher than `min_conf_level=0.5` would suggest if applied to the raw data, because the early filtering steps disproportionately remove low-confidence rows (e.g., pronoun-containing triples that OpenIE extracts with lower confidence). This means the pipeline may silently discard more relations than intended. The `min_conf_level=0.5` parameter is therefore not directly interpretable as "retain the top 50% of all OpenIE extractions" — it means "retain the top 50% of the triples that survived the linguistic filters."
+
+**Suggested fix:** If the intent is to apply a threshold relative to the raw extraction quality, the confidence filter should be applied first (before linguistic filtering), or the documentation should explicitly state that the threshold is relative to the post-filter distribution.
+
+---
+
+#### Critique 6 — `confidence` Excluded from `for_class` Features Without Justification
+
+**What the first-attempt code used (classifier.ipynb, Cell 18–19):**
+```python
+# Cell 18 — Attempt 1 feature assembly (full_annot.xlsx)
+confidence = final.loc[:, ['confidence']].values
+len_arg1   = np.expand_dims(final.loc[:, 'len_arg1'].values, axis=1)
+len_rel    = np.expand_dims(final.loc[:, 'len_rel'].values, axis=1)
+len_arg2   = np.expand_dims(final.loc[:, 'len_arg2'].values, axis=1)
+
+# Cell 19
+X = np.hstack([embeddings_arg1, embeddings_rel, embeddings_arg2,
+               confidence, len_arg1, len_rel, len_arg2])
+```
+In the first attempt, `confidence` was explicitly included as one of the 7 scalar features (alongside the three length features).
+
+**What the second-attempt `for_class` function uses (classifier.ipynb, Cell 37 — the function that produces the saved model's training data):**
+```python
+def for_class(df, x):
+    ...
+    db = np.hstack([embeddings_arg1, len_arg1, nouns, pronouns,
+                    adjectives, verbs, rel_nouns, rel_pronouns,
+                    rel_adjectives, rel_verbs, rel_adverbs,
+                    rel_determiners, rel_numerals])
+    return db, db_aux
+```
+The `confidence` column is present in the source DataFrame (`second_try_annotations.csv`) but is never extracted or included in the feature matrix. The inference version in **main_notebook Cell 1** matches: it also omits `confidence`.
+
+**Why this matters:** The OpenIE `confidence` score is an explicit, model-derived quality signal for each individual triple. High-confidence extractions are those where the OpenIE model's internal probability is high that the extracted triple faithfully represents the source sentence. It is therefore a direct, numerically measurable proxy for the kind of validity that `is_valuable` is trying to capture (whether a triple makes sense). In the first attempt (Cells 18–19), including `confidence` was a deliberate choice. In the second attempt (Cell 37), the feature was silently dropped without explanation.
+
+**Concrete inconsistency between attempts:** The second attempt replaces `confidence` with 11 POS-tag count and ratio features. This expansion is well-motivated (POS composition captures phrase type), but the removal of `confidence` as a complementary feature is not. A Random Forest with `n=150` training samples and `396` features (of which 384 are dense embedding dimensions) could potentially benefit from having `confidence` as an additional low-noise scalar feature, since the tree-splitting algorithm can directly threshold it with a single decision boundary. The current feature set requires the Random Forest to infer confidence-related distinctions indirectly from the POS composition and embedding of the phrase.
+
+**Impact assessment:** Both training (`classifier Cell 37`) and inference (`main_notebook Cell 1`) omit `confidence` consistently, so there is no train/inference mismatch (which would be a bug). The issue is a missed opportunity: a potentially high-signal feature was available and present in the training data but was not used in the model that was ultimately saved and deployed. The classifier's reported >81% accuracy may have been higher had `confidence` been retained.
 
 ### 5.2 Primary Limitations
 
